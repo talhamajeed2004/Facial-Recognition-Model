@@ -1,0 +1,191 @@
+pip install opencv-python
+pip install numpy torch torchvision
+pip install facenet-pytorch
+
+# Cell 1: Imports and Setup
+import torch
+import cv2
+import os
+import time
+from PIL import Image
+from facenet_pytorch import MTCNN, InceptionResnetV1
+
+print("All libraries imported successfully.")
+
+# Cell 2: Model and Device Configuration
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f'Running on device: {device}')
+
+# Initialize MTCNN for face detection
+mtcnn = MTCNN(image_size=160, margin=14, keep_all=True, device=device)
+
+# Initialize InceptionResnetV1 for face embedding extraction
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
+
+print("Models initialized successfully.")
+
+# Cell 3: Function to Build the Initial Database
+def generate_known_embeddings(database_path):
+    """
+    Processes a directory of images to create a database of known face embeddings.
+    This function will run only if a pre-saved embeddings file is not found.
+    """
+    known_embeddings = {}
+    for person_name in os.listdir(database_path):
+        person_dir = os.path.join(database_path, person_name)
+        if not os.path.isdir(person_dir):
+            continue
+        embeddings_list = []
+        for image_name in os.listdir(person_dir):
+            image_path = os.path.join(person_dir, image_name)
+            if not os.path.isfile(image_path):
+                continue
+            try:
+                img = Image.open(image_path).convert('RGB')
+                face_tensors = mtcnn(img)
+                if face_tensors is not None:
+                    for face_tensor in face_tensors:
+                        embedding = resnet(face_tensor.unsqueeze(0).to(device))
+                        embeddings_list.append(embedding.detach().cpu())
+            except Exception as e:
+                print(f"Could not process image {image_path}: {e}")
+        if embeddings_list:
+            known_embeddings[person_name] = torch.cat(embeddings_list).mean(0, keepdim=True)
+            print(f"Generated initial embeddings for {person_name}")
+    return known_embeddings
+
+print("Database generation function is defined.")
+
+
+# Cell 4: Load or Create the Face Database
+print("Initializing face database...")
+
+# Define paths
+database_folder = 'face_database'
+embeddings_file = 'known_faces_embeddings.pt'
+
+# Create database folder if it doesn't exist
+os.makedirs(database_folder, exist_ok=True) 
+
+# Logic to load existing database or create a new one
+if os.path.exists(embeddings_file):
+    print("Loading known faces from saved file.")
+    known_faces_embeddings = torch.load(embeddings_file)
+else:
+    print("No saved database found. Generating new embeddings from folder...")
+    known_faces_embeddings = generate_known_embeddings(database_folder)
+    # Save the newly generated embeddings for future runs
+    torch.save(known_faces_embeddings, embeddings_file)
+
+print("\n---------------------------------")
+print("Known faces database is ready.")
+
+if known_faces_embeddings:
+    print("The following people are in the database:")
+    print(list(known_faces_embeddings.keys()))
+else:
+    print("The database is empty. You can start with an empty 'face_database' folder.”)
+# Cell 5: Main CCTV Processing and Recognition Loop
+
+# --- Configuration ---
+DISTANCE_THRESHOLD = 0.8
+MIN_FACE_SIZE = 40 * 40
+
+# --- IMPORTANT: Set the path to your video file ---
+video_file_path = 'recording 4.mkv' # <--- CHANGE THIS PATH
+
+    
+# --- ADD THIS: Initialize the presence flag for the target person ---
+talha_majeed_present = 0   <--- CHANGE THIS PATH
+
+# --- Video Capture ---
+cap = cv2.VideoCapture(video_file_path)
+
+# --- Add a frame skip counter ---
+frame_count = 0
+frames_to_skip = 2 # This will process every 3rd frame (1 frame processed, 2 skipped)
+
+if not cap.isOpened():
+    print(f"Error: Could not open video file: {video_file_path}")
+else:
+    print("Processing video file. Press 'q' in the video window to quit.")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("End of video file reached.")
+            break
+
+        # --- Frame skipping logic ---
+        if frame_count % (frames_to_skip + 1) != 0:
+            frame_count += 1
+            continue
+        frame_count += 1
+        # --- End of frame skipping logic ---
+
+
+        try:
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            boxes, _ = mtcnn.detect(img)
+            face_tensors = mtcnn(img)
+            
+            if face_tensors is not None:
+                for face_tensor, box in zip(face_tensors, boxes):
+                    unknown_embedding = resnet(face_tensor.to(device).unsqueeze(0)).detach().cpu()
+                    
+                    min_dist = float('inf')
+                    recognized_name = "Unknown"
+                    for name, known_emb in known_faces_embeddings.items():
+                        distance = (known_emb - unknown_embedding).norm().item()
+                        if distance < min_dist:
+                            min_dist = distance
+                            if min_dist < DISTANCE_THRESHOLD:
+                                recognized_name = name
+            # --- ADD THIS: Check if the recognized person is our target ---
+                                if recognized_name == "Talha_Majeed":
+                                    talha_majeed_present = 1
+
+                    
+                    if recognized_name == "Unknown":
+                        x1, y1, x2, y2 = [int(b) for b in box]
+                        if (x2 - x1) * (y2 - y1) > MIN_FACE_SIZE:
+                            new_person_name = f"person_{int(time.time())}"
+                            new_person_folder = os.path.join(database_folder, new_person_name)
+                            os.makedirs(new_person_folder, exist_ok=True)
+                            face_crop = frame[y1:y2, x1:x2]
+                            image_path = os.path.join(new_person_folder, "1.jpg")
+                            cv2.imwrite(image_path, face_crop)
+                            print(f"Saved new face for '{new_person_name}'")
+                            known_faces_embeddings[new_person_name] = unknown_embedding
+                            recognized_name = new_person_name
+
+                    x1, y1, x2, y2 = [int(b) for b in box]
+                    color = (0, 255, 0) if recognized_name != "Unknown" else (0, 0, 255)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    display_text = f"{recognized_name} ({min_dist:.2f})"
+                    cv2.rectangle(frame, (x1, y2 - 25), (x2, y2), color, cv2.FILLED)
+                    cv2.putText(frame, display_text, (x1 + 6, y2 - 6), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
+
+        except Exception as e:
+            print(f"An error occurred during frame processing: {e}")
+
+        cv2.imshow('CCTV Face Recognition', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # --- Cleanup ---
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Video stream stopped.")
+
+      # --- ADD THIS: Display the final presence signal ---
+    print("\n---------------------------------")
+    print(f"Signal for Talha_Majeed's presence: {talha_majeed_present}")
+    print("---------------------------------")
+
+
+# Cell 6: Final Save of the Database
+print("\nSaving updated face database to file...")
+torch.save(known_faces_embeddings, embeddings_file)
+print(f"Database saved successfully to '{embeddings_file}'.")
+print("The following people are now in the database:")
+print(list(known_faces_embeddings.keys()))
